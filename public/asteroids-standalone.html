@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Asteroids</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000; height: 100%; overflow: hidden; }
+  #wrap {
+    position: fixed; inset: 0; background: #000; overflow: hidden;
+    touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+  }
+  canvas { display: block; touch-action: none; }
+  .tbtn {
+    border: 2px solid rgba(255,255,255,0.55);
+    background: rgba(255,255,255,0.08);
+    color: rgba(255,255,255,0.85);
+    border-radius: 50%;
+    width: 64px; height: 64px; font-size: 13px;
+    font-family: 'Lucida Console', Monaco, monospace;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+  }
+  .tbtn.big { width: 84px; height: 84px; font-size: 15px; }
+  .sbtn {
+    border: 1px solid rgba(255,255,255,0.45);
+    background: rgba(255,255,255,0.08);
+    color: rgba(255,255,255,0.85);
+    border-radius: 8px; padding: 6px 10px; font-size: 13px;
+    font-family: 'Lucida Console', Monaco, monospace;
+    touch-action: manipulation; user-select: none; -webkit-user-select: none;
+  }
+  #topbar { position: absolute; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right)); display: flex; gap: 8px; }
+  #rotpad { position: absolute; left: max(14px, env(safe-area-inset-left)); bottom: max(18px, env(safe-area-inset-bottom)); display: flex; gap: 14px; }
+  #actpad { position: absolute; right: max(14px, env(safe-area-inset-right)); bottom: max(18px, env(safe-area-inset-bottom)); display: flex; flex-direction: column; align-items: flex-end; gap: 12px; }
+  #actrow { display: flex; align-items: flex-end; gap: 12px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game"></canvas>
+  <div id="topbar">
+    <button class="sbtn" id="btn-mute" aria-label="Mute">SOUND ON</button>
+    <button class="sbtn" id="btn-pause" aria-label="Pause">&#9208;</button>
+  </div>
+  <div id="rotpad">
+    <button class="tbtn big" id="btn-left" aria-label="Rotate left">&#9664;</button>
+    <button class="tbtn big" id="btn-right" aria-label="Rotate right">&#9654;</button>
+  </div>
+  <div id="actpad">
+    <button class="tbtn" id="btn-hyper" aria-label="Hyperspace" style="width:58px;height:58px;margin-right:90px;">HYPER</button>
+    <div id="actrow">
+      <button class="tbtn" id="btn-thrust" aria-label="Thrust" style="margin-bottom:14px;">THRUST</button>
+      <button class="tbtn big" id="btn-fire" aria-label="Fire">FIRE</button>
+    </div>
+  </div>
+</div>
+<script>
+(function () {
+  "use strict";
+
+  var ROCK_R = [52, 27, 14];
+  var ROCK_SCORE = [20, 50, 100];
+  var ROCK_SPEED = [70, 115, 165];
+  var SHIP_R = 13;
+  var TURN_SPEED = 4.3;
+  var THRUST = 330;
+  var MAX_SPEED = 470;
+  var BULLET_SPEED = 620;
+  var BULLET_LIFE = 1.05;
+  var MAX_BULLETS = 4;
+  var SAUCER_SCORE = { big: 200, small: 1000 };
+  var EXTRA_LIFE_EVERY = 10000;
+  var HS_KEY = "asteroids-highscore";
+
+  var canvas = document.getElementById("game");
+  var ctx = canvas.getContext("2d");
+
+  var input = { left: false, right: false, thrust: false, fire: false, hyper: false };
+  var muted = false;
+
+  var high = 0;
+  try { high = parseInt(localStorage.getItem(HS_KEY) || "0", 10) || 0; } catch (e) {}
+
+  var G = {
+    mode: "title", w: 0, h: 0, u: 1,
+    score: 0, high: high, lives: 0, wave: 0, nextLifeAt: EXTRA_LIFE_EVERY,
+    ship: { x: 0, y: 0, a: -Math.PI / 2, vx: 0, vy: 0, dead: true, inv: 0, hyperT: 0, hyperCd: 0 },
+    rocks: [], bullets: [], parts: [],
+    saucer: null, saucerT: 12,
+    respawnT: 0, waveT: 0, overT: 0, restartLock: 0,
+    waveRockCount: 1,
+    firePrev: false, fireHold: 0, hyperPrev: false,
+    beatT: 1, beatHi: false,
+    paused: false, time: 0
+  };
+
+  var A = { ctx: null, master: null, thrustGain: null, saucerOsc: null, saucerGain: null, saucerLfo: null };
+
+  function rand(a, b) { return a + Math.random() * (b - a); }
+  function wrap(o, w, h, m) {
+    if (o.x < -m) o.x += w + m * 2;
+    if (o.x > w + m) o.x -= w + m * 2;
+    if (o.y < -m) o.y += h + m * 2;
+    if (o.y > h + m) o.y -= h + m * 2;
+  }
+  function dist2(ax, ay, bx, by) { var dx = ax - bx, dy = ay - by; return dx * dx + dy * dy; }
+  function makeShape() {
+    var n = 10 + Math.floor(Math.random() * 3), s = [];
+    for (var i = 0; i < n; i++) s.push(rand(0.72, 1.12));
+    return s;
+  }
+
+  // ---------- audio ----------
+  function initAudio() {
+    if (A.ctx) { if (A.ctx.state === "suspended") A.ctx.resume(); return; }
+    try { A.ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
+    var ac = A.ctx;
+    A.master = ac.createGain();
+    A.master.gain.value = 0.5;
+    A.master.connect(ac.destination);
+
+    var len = ac.sampleRate;
+    var buf = ac.createBuffer(1, len, ac.sampleRate);
+    var d = buf.getChannelData(0);
+    for (var i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    var src = ac.createBufferSource();
+    src.buffer = buf; src.loop = true;
+    var bp = ac.createBiquadFilter();
+    bp.type = "lowpass"; bp.frequency.value = 320;
+    A.thrustGain = ac.createGain();
+    A.thrustGain.gain.value = 0;
+    src.connect(bp); bp.connect(A.thrustGain); A.thrustGain.connect(A.master);
+    src.start();
+
+    A.saucerOsc = ac.createOscillator();
+    A.saucerOsc.type = "triangle";
+    A.saucerOsc.frequency.value = 220;
+    A.saucerLfo = ac.createOscillator();
+    A.saucerLfo.type = "square";
+    A.saucerLfo.frequency.value = 5;
+    var lfoGain = ac.createGain();
+    lfoGain.gain.value = 60;
+    A.saucerLfo.connect(lfoGain); lfoGain.connect(A.saucerOsc.frequency);
+    A.saucerGain = ac.createGain();
+    A.saucerGain.gain.value = 0;
+    A.saucerOsc.connect(A.saucerGain); A.saucerGain.connect(A.master);
+    A.saucerOsc.start();
+    A.saucerLfo.start();
+  }
+
+  function sfxOk() { return !!A.ctx && !muted; }
+
+  function blip(freq, endFreq, dur, type, vol, when) {
+    if (!sfxOk()) return;
+    var ac = A.ctx, t = ac.currentTime + (when || 0);
+    var o = ac.createOscillator();
+    o.type = type;
+    o.frequency.setValueAtTime(freq, t);
+    o.frequency.exponentialRampToValueAtTime(Math.max(1, endFreq), t + dur);
+    var g = ac.createGain();
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(g); g.connect(A.master);
+    o.start(t);
+    o.stop(t + dur + 0.02);
+  }
+
+  function noiseBurst(dur, cutoff, vol) {
+    if (!sfxOk()) return;
+    var ac = A.ctx, len = Math.floor(ac.sampleRate * dur);
+    var buf = ac.createBuffer(1, len, ac.sampleRate);
+    var d = buf.getChannelData(0);
+    for (var i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    var src = ac.createBufferSource();
+    src.buffer = buf;
+    var f = ac.createBiquadFilter();
+    f.type = "lowpass"; f.frequency.value = cutoff;
+    var g = ac.createGain();
+    g.gain.value = vol;
+    src.connect(f); f.connect(g); g.connect(A.master);
+    src.start();
+  }
+
+  var sfx = {
+    fire: function () { blip(900, 200, 0.14, "square", 0.16); },
+    saucerFire: function () { blip(500, 120, 0.18, "sawtooth", 0.12); },
+    boomBig: function () { noiseBurst(0.65, 500, 0.75); },
+    boomMed: function () { noiseBurst(0.45, 900, 0.6); },
+    boomSmall: function () { noiseBurst(0.3, 1600, 0.5); },
+    shipBoom: function () { noiseBurst(0.9, 400, 0.9); },
+    hyper: function () { blip(200, 1400, 0.25, "sine", 0.2); },
+    beat: function (hi) { blip(hi ? 66 : 54, hi ? 66 : 54, 0.11, "sine", 0.55); },
+    extraLife: function () { for (var i = 0; i < 5; i++) blip(980, 980, 0.09, "square", 0.18, i * 0.13); }
+  };
+
+  // ---------- sizing ----------
+  function resize() {
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var w = window.innerWidth, h = window.innerHeight;
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
+    canvas.style.width = w + "px";
+    canvas.style.height = h + "px";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    G.w = w; G.h = h;
+    G.u = Math.min(w, h) / 760;
+  }
+  resize();
+
+  // ---------- spawning ----------
+  function spawnRock(size, x, y) {
+    var ang = rand(0, Math.PI * 2);
+    var sp = ROCK_SPEED[size] * rand(0.6, 1.25) * (1 + Math.min(0.5, (G.wave - 1) * 0.07)) * G.u;
+    return {
+      x: x, y: y,
+      vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp,
+      size: size, r: ROCK_R[size] * G.u,
+      shape: makeShape(), rot: rand(0, Math.PI * 2), rotV: rand(-1.2, 1.2)
+    };
+  }
+
+  function spawnWaveRocks(count) {
+    for (var i = 0; i < count; i++) {
+      var x, y, tries = 0;
+      do {
+        if (Math.random() < 0.5) { x = Math.random() < 0.5 ? 0 : G.w; y = rand(0, G.h); }
+        else { x = rand(0, G.w); y = Math.random() < 0.5 ? 0 : G.h; }
+        tries++;
+      } while (dist2(x, y, G.ship.x, G.ship.y) < Math.pow(240 * G.u, 2) && tries < 30);
+      G.rocks.push(spawnRock(0, x, y));
+    }
+  }
+
+  function startWave() {
+    G.wave++;
+    var count = Math.min(11, 4 + (G.wave - 1) * 2);
+    G.waveRockCount = count * 7;
+    spawnWaveRocks(count);
+    G.saucerT = rand(9, 16);
+    G.beatT = 1;
+  }
+
+  function startGame() {
+    G.score = 0; G.lives = 3; G.wave = 0;
+    G.nextLifeAt = EXTRA_LIFE_EVERY;
+    G.rocks = []; G.bullets = []; G.parts = [];
+    G.saucer = null;
+    G.mode = "playing"; G.paused = false;
+    G.ship.x = G.w / 2; G.ship.y = G.h / 2;
+    G.ship.vx = 0; G.ship.vy = 0;
+    G.ship.a = -Math.PI / 2;
+    G.ship.dead = false; G.ship.inv = 2;
+    G.ship.hyperT = 0; G.ship.hyperCd = 0;
+    startWave();
+  }
+
+  function spawnSaucer() {
+    var small = Math.random() < Math.min(0.85, 0.2 + G.score / 30000);
+    var r = (small ? 12 : 20) * G.u;
+    var fromLeft = Math.random() < 0.5;
+    var speed = (small ? 175 : 130) * G.u;
+    G.saucer = {
+      x: fromLeft ? -r : G.w + r,
+      y: rand(G.h * 0.15, G.h * 0.85),
+      vx: fromLeft ? speed : -speed,
+      vy: 0,
+      small: small, r: r,
+      fireT: rand(0.5, 1),
+      dirT: rand(0.8, 2),
+      exitDir: fromLeft ? 1 : -1
+    };
+    if (A.saucerOsc) A.saucerOsc.frequency.value = small ? 330 : 190;
+    if (A.saucerLfo) A.saucerLfo.frequency.value = small ? 7 : 4.5;
+  }
+
+  // ---------- effects ----------
+  function debris(x, y, n, sp, lines) {
+    for (var i = 0; i < n; i++) {
+      var ang = rand(0, Math.PI * 2);
+      var v = rand(0.2, 1) * sp * G.u;
+      G.parts.push({
+        x: x, y: y,
+        vx: Math.cos(ang) * v, vy: Math.sin(ang) * v,
+        life: rand(0.4, lines ? 1.6 : 0.9), maxLife: 1,
+        len: lines ? rand(4, 12) * G.u : 0,
+        a: rand(0, Math.PI * 2), spin: rand(-4, 4)
+      });
+    }
+  }
+
+  function addScore(pts) {
+    G.score += pts;
+    if (G.score >= G.nextLifeAt) {
+      G.nextLifeAt += EXTRA_LIFE_EVERY;
+      G.lives++;
+      sfx.extraLife();
+    }
+    if (G.score > G.high) G.high = G.score;
+  }
+
+  function killRock(idx, award) {
+    var rk = G.rocks[idx];
+    G.rocks.splice(idx, 1);
+    if (award) addScore(ROCK_SCORE[rk.size]);
+    if (rk.size === 0) sfx.boomBig();
+    else if (rk.size === 1) sfx.boomMed();
+    else sfx.boomSmall();
+    debris(rk.x, rk.y, rk.size === 2 ? 6 : 10, 130, false);
+    if (rk.size < 2) {
+      for (var i = 0; i < 2; i++) {
+        var child = spawnRock(rk.size + 1, rk.x, rk.y);
+        child.vx = child.vx * 0.8 + rk.vx * 0.5;
+        child.vy = child.vy * 0.8 + rk.vy * 0.5;
+        G.rocks.push(child);
+      }
+    }
+  }
+
+  function killSaucer(award) {
+    var s = G.saucer;
+    if (!s) return;
+    if (award) addScore(s.small ? SAUCER_SCORE.small : SAUCER_SCORE.big);
+    debris(s.x, s.y, 12, 150, false);
+    sfx.boomMed();
+    G.saucer = null;
+    G.saucerT = rand(8, 15);
+  }
+
+  function destroyShip() {
+    if (G.ship.dead) return;
+    G.ship.dead = true;
+    sfx.shipBoom();
+    debris(G.ship.x, G.ship.y, 14, 120, true);
+    G.lives--;
+    if (G.lives <= 0) G.overT = 1.2;
+    else G.respawnT = 2.2;
+  }
+
+  function fireShipBullet() {
+    var count = 0;
+    for (var i = 0; i < G.bullets.length; i++) if (G.bullets[i].fromShip) count++;
+    if (count >= MAX_BULLETS) return;
+    var s = G.ship, nose = SHIP_R * G.u;
+    G.bullets.push({
+      x: s.x + Math.cos(s.a) * nose,
+      y: s.y + Math.sin(s.a) * nose,
+      vx: Math.cos(s.a) * BULLET_SPEED * G.u + s.vx,
+      vy: Math.sin(s.a) * BULLET_SPEED * G.u + s.vy,
+      life: BULLET_LIFE, fromShip: true
+    });
+    sfx.fire();
+  }
+
+  function hyperspace() {
+    var s = G.ship;
+    if (s.dead || s.hyperT > 0 || s.hyperCd > 0) return;
+    sfx.hyper();
+    s.hyperT = 0.6;
+    s.hyperCd = 1.5;
+  }
+
+  // ---------- update ----------
+  function update(dt) {
+    G.time += dt;
+    if (G.restartLock > 0) G.restartLock -= dt;
+
+    for (var i = G.parts.length - 1; i >= 0; i--) {
+      var p = G.parts[i];
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.a += p.spin * dt;
+      p.life -= dt;
+      if (p.life <= 0) G.parts.splice(i, 1);
+    }
+
+    if (G.mode === "title") {
+      if (G.rocks.length < 6) {
+        G.wave = 1;
+        G.rocks.push(spawnRock(Math.floor(Math.random() * 3), rand(0, G.w), Math.random() < 0.5 ? -40 : G.h + 40));
+      }
+      for (var ti = 0; ti < G.rocks.length; ti++) {
+        var trk = G.rocks[ti];
+        trk.x += trk.vx * dt; trk.y += trk.vy * dt; trk.rot += trk.rotV * dt;
+        wrap(trk, G.w, G.h, trk.r);
+      }
+      return;
+    }
+
+    if (G.paused) return;
+
+    var s = G.ship;
+
+    if (!s.dead) {
+      if (s.hyperT > 0) {
+        s.hyperT -= dt;
+        if (s.hyperT <= 0) {
+          s.x = rand(G.w * 0.1, G.w * 0.9);
+          s.y = rand(G.h * 0.1, G.h * 0.9);
+          s.vx = 0; s.vy = 0;
+          if (Math.random() < 0.14) destroyShip();
+        }
+      } else {
+        if (input.left) s.a -= TURN_SPEED * dt;
+        if (input.right) s.a += TURN_SPEED * dt;
+        if (input.thrust) {
+          s.vx += Math.cos(s.a) * THRUST * G.u * dt;
+          s.vy += Math.sin(s.a) * THRUST * G.u * dt;
+          var sp = Math.hypot(s.vx, s.vy), max = MAX_SPEED * G.u;
+          if (sp > max) { s.vx *= max / sp; s.vy *= max / sp; }
+        }
+        var drag = Math.exp(-0.45 * dt);
+        s.vx *= drag; s.vy *= drag;
+        s.x += s.vx * dt; s.y += s.vy * dt;
+        wrap(s, G.w, G.h, SHIP_R * G.u);
+      }
+      if (s.inv > 0) s.inv -= dt;
+      if (s.hyperCd > 0) s.hyperCd -= dt;
+
+      if (input.fire && !G.firePrev) {
+        fireShipBullet();
+        G.fireHold = 0;
+      } else if (input.fire) {
+        G.fireHold += dt;
+        if (G.fireHold >= 0.22) { fireShipBullet(); G.fireHold = 0; }
+      }
+      if (input.hyper && !G.hyperPrev) hyperspace();
+    } else if (G.mode === "playing" && G.lives > 0) {
+      G.respawnT -= dt;
+      if (G.respawnT <= 0) {
+        var cx = G.w / 2, cy = G.h / 2;
+        var clearR = Math.pow(170 * G.u, 2);
+        var safe = true;
+        for (var ri = 0; ri < G.rocks.length; ri++) {
+          var rr0 = G.rocks[ri];
+          if (dist2(rr0.x, rr0.y, cx, cy) < clearR + rr0.r * rr0.r) { safe = false; break; }
+        }
+        if (G.saucer && dist2(G.saucer.x, G.saucer.y, cx, cy) < clearR * 2) safe = false;
+        for (var bi = 0; bi < G.bullets.length; bi++) {
+          var bb = G.bullets[bi];
+          if (!bb.fromShip && dist2(bb.x, bb.y, cx, cy) < clearR) { safe = false; break; }
+        }
+        if (safe) {
+          s.x = cx; s.y = cy; s.vx = 0; s.vy = 0; s.a = -Math.PI / 2;
+          s.dead = false; s.inv = 2.5; s.hyperT = 0; s.hyperCd = 0;
+        }
+      }
+    }
+    G.firePrev = input.fire;
+    G.hyperPrev = input.hyper;
+
+    if (G.lives <= 0 && G.overT > 0) {
+      G.overT -= dt;
+      if (G.overT <= 0) {
+        G.mode = "over";
+        G.restartLock = 0.8;
+        try { localStorage.setItem(HS_KEY, String(G.high)); } catch (e) {}
+      }
+    }
+
+    for (var rj = 0; rj < G.rocks.length; rj++) {
+      var rk = G.rocks[rj];
+      rk.x += rk.vx * dt; rk.y += rk.vy * dt; rk.rot += rk.rotV * dt;
+      wrap(rk, G.w, G.h, rk.r);
+    }
+
+    for (var bj = G.bullets.length - 1; bj >= 0; bj--) {
+      var b = G.bullets[bj];
+      b.x += b.vx * dt; b.y += b.vy * dt;
+      b.life -= dt;
+      wrap(b, G.w, G.h, 2);
+      if (b.life <= 0) G.bullets.splice(bj, 1);
+    }
+
+    if (G.saucer) {
+      var sc = G.saucer;
+      sc.x += sc.vx * dt; sc.y += sc.vy * dt;
+      if (sc.y < -sc.r) sc.y += G.h + sc.r * 2;
+      if (sc.y > G.h + sc.r) sc.y -= G.h + sc.r * 2;
+      sc.dirT -= dt;
+      if (sc.dirT <= 0) {
+        sc.dirT = rand(0.9, 2.2);
+        var spd = Math.abs(sc.vx);
+        sc.vy = [0, -0.6, 0.6][Math.floor(Math.random() * 3)] * spd;
+      }
+      sc.fireT -= dt;
+      if (sc.fireT <= 0 && !s.dead && s.hyperT <= 0) {
+        sc.fireT = sc.small ? 0.8 : 1.0;
+        var ang;
+        if (sc.small) {
+          ang = Math.atan2(s.y - sc.y, s.x - sc.x);
+          var err = Math.max(0.04, 0.35 - G.score / 100000);
+          ang += rand(-err, err);
+        } else {
+          ang = rand(0, Math.PI * 2);
+        }
+        var bs = 430 * G.u;
+        G.bullets.push({ x: sc.x, y: sc.y, vx: Math.cos(ang) * bs, vy: Math.sin(ang) * bs, life: 1.3, fromShip: false });
+        sfx.saucerFire();
+      }
+      if ((sc.exitDir === 1 && sc.x > G.w + sc.r) || (sc.exitDir === -1 && sc.x < -sc.r)) {
+        G.saucer = null;
+        G.saucerT = rand(8, 15);
+      }
+    } else if (G.mode === "playing" && G.lives > 0) {
+      G.saucerT -= dt;
+      if (G.saucerT <= 0) spawnSaucer();
+    }
+
+    if (A.saucerGain && A.ctx) {
+      A.saucerGain.gain.setTargetAtTime(G.saucer && !muted && !G.paused ? 0.12 : 0, A.ctx.currentTime, 0.05);
+    }
+    if (A.thrustGain && A.ctx) {
+      var wantT = !s.dead && s.hyperT <= 0 && input.thrust && !muted && !G.paused ? 0.35 : 0;
+      A.thrustGain.gain.setTargetAtTime(wantT, A.ctx.currentTime, 0.05);
+    }
+
+    // collisions
+    for (var ci = G.bullets.length - 1; ci >= 0; ci--) {
+      var cb = G.bullets[ci];
+      var hit = -1;
+      for (var cj = 0; cj < G.rocks.length; cj++) {
+        var crk = G.rocks[cj];
+        if (dist2(cb.x, cb.y, crk.x, crk.y) < crk.r * crk.r) { hit = cj; break; }
+      }
+      if (hit >= 0) {
+        G.bullets.splice(ci, 1);
+        killRock(hit, cb.fromShip);
+      }
+    }
+    for (var di = G.bullets.length - 1; di >= 0; di--) {
+      var db = G.bullets[di];
+      if (db.fromShip) {
+        if (G.saucer && dist2(db.x, db.y, G.saucer.x, G.saucer.y) < G.saucer.r * G.saucer.r) {
+          G.bullets.splice(di, 1);
+          killSaucer(true);
+        }
+      } else if (!s.dead && s.inv <= 0 && s.hyperT <= 0) {
+        var srr = SHIP_R * G.u * 0.8;
+        if (dist2(db.x, db.y, s.x, s.y) < srr * srr) {
+          G.bullets.splice(di, 1);
+          destroyShip();
+        }
+      }
+    }
+    if (!s.dead && s.inv <= 0 && s.hyperT <= 0) {
+      for (var ei = G.rocks.length - 1; ei >= 0; ei--) {
+        var erk = G.rocks[ei];
+        var err2 = erk.r + SHIP_R * G.u * 0.7;
+        if (dist2(s.x, s.y, erk.x, erk.y) < err2 * err2) {
+          killRock(ei, true);
+          destroyShip();
+          break;
+        }
+      }
+      if (G.saucer) {
+        var srr2 = G.saucer.r + SHIP_R * G.u * 0.7;
+        if (dist2(s.x, s.y, G.saucer.x, G.saucer.y) < srr2 * srr2) {
+          killSaucer(true);
+          destroyShip();
+        }
+      }
+    }
+    if (G.saucer) {
+      for (var fi = G.rocks.length - 1; fi >= 0; fi--) {
+        var frk = G.rocks[fi];
+        var frr = frk.r + G.saucer.r;
+        if (dist2(G.saucer.x, G.saucer.y, frk.x, frk.y) < frr * frr) {
+          killRock(fi, false);
+          killSaucer(false);
+          break;
+        }
+      }
+    }
+
+    if (G.mode === "playing" && G.rocks.length === 0 && !G.saucer && G.lives > 0) {
+      G.waveT += dt;
+      if (G.waveT > 2) { G.waveT = 0; startWave(); }
+    } else {
+      G.waveT = 0;
+    }
+
+    if (G.mode === "playing" && !s.dead && G.rocks.length > 0) {
+      G.beatT -= dt;
+      if (G.beatT <= 0) {
+        var work = 0;
+        for (var wi = 0; wi < G.rocks.length; wi++) work += [7, 3, 1][G.rocks[wi].size];
+        var frac = Math.min(1, work / Math.max(1, G.waveRockCount));
+        G.beatT = 0.28 + frac * 0.85;
+        G.beatHi = !G.beatHi;
+        sfx.beat(G.beatHi);
+      }
+    }
+  }
+
+  // ---------- drawing ----------
+  function strokePoly(pts, x, y, a, open) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(a);
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    if (!open) ctx.closePath();
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawShipAt(x, y, a, scale, flame) {
+    var r = SHIP_R * scale;
+    strokePoly([[r, 0], [-r * 0.75, r * 0.6], [-r * 0.45, r * 0.32], [-r * 0.45, -r * 0.32], [-r * 0.75, -r * 0.6]], x, y, a);
+    if (flame && Math.random() < 0.85) {
+      strokePoly([[-r * 0.45, r * 0.28], [-r * (0.9 + Math.random() * 0.35), 0], [-r * 0.45, -r * 0.28]], x, y, a, true);
+    }
+  }
+
+  function drawSaucer(sc) {
+    var r = sc.r;
+    strokePoly([[-r, r * 0.25], [-r * 0.45, r * 0.6], [r * 0.45, r * 0.6], [r, r * 0.25], [r * 0.45, -r * 0.1], [-r * 0.45, -r * 0.1]], sc.x, sc.y, 0);
+    strokePoly([[-r * 0.28, -r * 0.1], [-r * 0.18, -r * 0.5], [r * 0.18, -r * 0.5], [r * 0.28, -r * 0.1]], sc.x, sc.y, 0, true);
+    ctx.beginPath();
+    ctx.moveTo(sc.x - r, sc.y + r * 0.25);
+    ctx.lineTo(sc.x + r, sc.y + r * 0.25);
+    ctx.stroke();
+  }
+
+  function drawRock(rk) {
+    var n = rk.shape.length, pts = [];
+    for (var i = 0; i < n; i++) {
+      var ang = (i / n) * Math.PI * 2;
+      var rr = rk.r * rk.shape[i];
+      pts.push([Math.cos(ang) * rr, Math.sin(ang) * rr]);
+    }
+    strokePoly(pts, rk.x, rk.y, rk.rot);
+  }
+
+  function text(str, x, y, size, align) {
+    ctx.font = Math.round(size) + "px 'Lucida Console', Monaco, monospace";
+    ctx.textAlign = align || "center";
+    ctx.fillText(str, x, y);
+  }
+
+  function draw() {
+    var w = G.w, h = G.h, u = G.u;
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = "#fff";
+    ctx.fillStyle = "#fff";
+    ctx.lineWidth = Math.max(1, 1.4 * u);
+    ctx.shadowColor = "rgba(160,200,255,0.55)";
+    ctx.shadowBlur = 6 * u;
+
+    for (var i = 0; i < G.rocks.length; i++) drawRock(G.rocks[i]);
+    if (G.saucer) drawSaucer(G.saucer);
+
+    for (var j = 0; j < G.bullets.length; j++) {
+      var b = G.bullets[j];
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, 1.8 * u, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    for (var k = 0; k < G.parts.length; k++) {
+      var p = G.parts[k];
+      ctx.globalAlpha = Math.max(0, Math.min(1, p.life / 0.6));
+      if (p.len > 0) {
+        var dx = Math.cos(p.a) * p.len * 0.5, dy = Math.sin(p.a) * p.len * 0.5;
+        ctx.beginPath();
+        ctx.moveTo(p.x - dx, p.y - dy);
+        ctx.lineTo(p.x + dx, p.y + dy);
+        ctx.stroke();
+      } else {
+        ctx.fillRect(p.x - 1, p.y - 1, 2, 2);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    var s = G.ship;
+    if (G.mode !== "title" && !s.dead && s.hyperT <= 0) {
+      var blink = s.inv > 0 && Math.floor(G.time * 10) % 2 === 0;
+      if (!blink) drawShipAt(s.x, s.y, s.a, u, input.thrust);
+    }
+
+    ctx.shadowBlur = 0;
+    if (G.mode !== "title") {
+      text(String(G.score).length < 2 ? ("0" + G.score) : String(G.score), 18 * u, 34 * u, 26 * u, "left");
+      text(String(G.high).length < 2 ? ("0" + G.high) : String(G.high), w / 2, 30 * u, 16 * u);
+      for (var li = 0; li < G.lives; li++) {
+        drawShipAt(26 * u + li * 24 * u, 58 * u, -Math.PI / 2, 0.75 * u, false);
+      }
+    }
+
+    if (G.mode === "title") {
+      text("ASTEROIDS", w / 2, h * 0.32, 54 * u);
+      text("HIGH SCORE  " + G.high, w / 2, h * 0.42, 18 * u);
+      if (Math.floor(G.time * 1.6) % 2 === 0) text("TAP OR PRESS ENTER TO START", w / 2, h * 0.55, 20 * u);
+      text("ROTATE + THRUST + FIRE + HYPERSPACE", w / 2, h * 0.66, 13 * u);
+      text("KEYS: ←/→ or A/D · ↑/W · SPACE · SHIFT/H", w / 2, h * 0.70, 13 * u);
+      text("20 · 50 · 100 PTS — SAUCERS 200 / 1000", w / 2, h * 0.74, 13 * u);
+    } else if (G.mode === "over") {
+      text("GAME OVER", w / 2, h * 0.42, 44 * u);
+      text("SCORE  " + G.score, w / 2, h * 0.51, 20 * u);
+      if (G.score >= G.high && G.score > 0) text("NEW HIGH SCORE!", w / 2, h * 0.57, 16 * u);
+      if (Math.floor(G.time * 1.6) % 2 === 0) text("TAP OR PRESS ENTER TO PLAY AGAIN", w / 2, h * 0.66, 16 * u);
+    } else if (G.paused) {
+      text("PAUSED", w / 2, h * 0.5, 36 * u);
+      text("TAP OR PRESS P TO RESUME", w / 2, h * 0.58, 14 * u);
+    }
+  }
+
+  // ---------- loop ----------
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // ---------- input ----------
+  function press(e, down) {
+    switch (e.code) {
+      case "ArrowLeft": case "KeyA": input.left = down; break;
+      case "ArrowRight": case "KeyD": input.right = down; break;
+      case "ArrowUp": case "KeyW": input.thrust = down; break;
+      case "Space": input.fire = down; break;
+      case "ShiftLeft": case "ShiftRight": case "KeyH": input.hyper = down; break;
+      default: return;
+    }
+    e.preventDefault();
+  }
+
+  window.addEventListener("keydown", function (e) {
+    initAudio();
+    if (e.code === "Enter") {
+      if (G.mode === "title" || (G.mode === "over" && G.restartLock <= 0)) startGame();
+      return;
+    }
+    if (e.code === "KeyP" && G.mode === "playing") { G.paused = !G.paused; return; }
+    if (e.code === "KeyM") { toggleMute(); return; }
+    if (G.paused && G.mode === "playing") { G.paused = false; return; }
+    press(e, true);
+  });
+  window.addEventListener("keyup", function (e) { press(e, false); });
+  window.addEventListener("resize", resize);
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden && G.mode === "playing") G.paused = true;
+  });
+
+  canvas.addEventListener("pointerdown", function (e) {
+    e.preventDefault();
+    initAudio();
+    if (G.mode === "title" || (G.mode === "over" && G.restartLock <= 0)) startGame();
+    else if (G.paused) G.paused = false;
+  });
+
+  function bindHold(id, key) {
+    var el = document.getElementById(id);
+    el.addEventListener("pointerdown", function (e) {
+      e.preventDefault();
+      input[key] = true;
+      try { el.setPointerCapture(e.pointerId); } catch (err) {}
+      initAudio();
+    });
+    function release(e) { e.preventDefault(); input[key] = false; }
+    el.addEventListener("pointerup", release);
+    el.addEventListener("pointercancel", release);
+    el.addEventListener("contextmenu", function (e) { e.preventDefault(); });
+  }
+  bindHold("btn-left", "left");
+  bindHold("btn-right", "right");
+  bindHold("btn-thrust", "thrust");
+  bindHold("btn-fire", "fire");
+  bindHold("btn-hyper", "hyper");
+
+  function toggleMute() {
+    muted = !muted;
+    document.getElementById("btn-mute").textContent = muted ? "SOUND OFF" : "SOUND ON";
+  }
+  document.getElementById("btn-mute").addEventListener("click", toggleMute);
+  document.getElementById("btn-pause").addEventListener("click", function () {
+    if (G.mode === "playing") G.paused = !G.paused;
+  });
+})();
+</script>
+</body>
+</html>
